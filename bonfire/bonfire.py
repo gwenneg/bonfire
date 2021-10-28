@@ -760,6 +760,7 @@ def _cmd_namespace_release(namespace, force):
     callback=_validate_reservation_duration,
 )
 def _cmd_namespace_extend(namespace, duration):
+    """Extend a reservation of an ephemeral namespace"""
     def _err_handler(err):
         msg = f"reservation extension failed: {str(err)}"
         _error(msg)
