@@ -973,6 +973,14 @@ def _cmd_process(
     is_flag=True,
     help="Do not release namespace reservation if deployment fails",
 )
+@click.option(
+    "--retries",
+    "-r",
+    required=False,
+    type=int,
+    default=0,
+    help="how many times to retry namespace reserve before giving up (default: infinite)",
+)
 @options(_ns_reserve_options)
 @options(_timeout_option)
 def _cmd_config_deploy(
@@ -990,6 +998,8 @@ def _cmd_config_deploy(
     no_remove_resources,
     single_replicas,
     namespace,
+    name,
+    requester,
     duration,
     retries,
     timeout,
