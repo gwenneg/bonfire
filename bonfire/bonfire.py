@@ -729,10 +729,14 @@ def _cmd_namespace_release(namespace, force):
         res = get_reservation(namespace=namespace)
         if res:
             _warn_before_delete()
-            res_name = res["metadata"]["name"]
-            log.info("deleting reservation '%s'", res_name)
-            oc("delete", "reservation", res_name)
-            log.info("reservation '%s' deleted", res_name)
+            res_config = process_reservation(
+                res["metadata"]["name"],
+                res["spec"]["requester"],
+                "-240h",  # hack
+            )
+
+            apply_config(None, list_resource=res_config)
+            log.info("releasing namespace '%s'", namespace)
         else:
             raise FatalError("Reservation lookup failed")
     except KeyboardInterrupt as err:
