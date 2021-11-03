@@ -12,15 +12,20 @@ from wait_for import TimedOutError
 import bonfire.config as conf
 from bonfire.qontract import get_namespaces_for_env, get_secret_names_in_namespace
 from bonfire.openshift import (
+    apply_config,
     oc,
     on_k8s,
     get_all_namespaces,
     get_json,
+    get_reservation,
     copy_namespace_secrets,
     process_template,
     wait_for_all_resources,
+    wait_on_reservation,
     whoami,
 )
+from bonfire.processor import process_reservation
+from bonfire.utils import FatalError
 
 
 NS_RESERVED = "ephemeral-ns-reserved"
@@ -269,61 +274,61 @@ def _should_renew_ns(namespace, duration):
     return True
 
 
-def reserve_namespace(duration, retries, specific_namespace=None, attempt=0):
-    attempt = attempt + 1
+def reserve_namespace(name, requester, duration, timeout):
+    try:
+        res = get_reservation(name)
+        # Name should be unique on reservation creation.
+        if res:
+            raise FatalError(f"Reservation with name {name} already exists")
 
-    ns_name = specific_namespace if specific_namespace else ""
-    log.info("attempt [%d] to reserve namespace %s", attempt, ns_name)
+        res_config = process_reservation(name, requester, duration)
 
-    if specific_namespace:
-        log.debug("specific namespace requested: %s", ns_name)
-        # look up both available ns's and ns's owned by 'me' to allow for renewing reservation
-        available_namespaces = get_namespaces(available=True, mine=True)
-        available_namespaces = [ns for ns in available_namespaces if ns.name == specific_namespace]
+        log.debug("processed reservation:\n%s", res_config)
+
+        try:
+            res_name = res_config["items"][0]["metadata"]["name"]
+        except (KeyError, IndexError):
+            raise Exception(
+                "error parsing name of Reservation from processed template, "
+                "check Reservation template"
+            )
+
+        apply_config(None, list_resource=res_config)
+
+        ns_name = wait_on_reservation(res_name, timeout)
+    except (KeyboardInterrupt, Exception, FatalError, TimedOutError) as err:
+        log.error("Encountered error during namespace reservation: %s", err)
+        return None, err
     else:
-        # if a specific namespace was not requested, only look up available ones
-        available_namespaces = get_namespaces(available=True, mine=False)
+        log.info(
+            "namespace '%s' is reserved by '%s' for '%s'",
+            ns_name,
+            requester,
+            duration,
+        )
 
-    if not available_namespaces:
-        log.info("all namespaces currently unavailable")
-
-        if retries and attempt > retries:
-            log.error("maximum retries reached")
-            return None
-
-        log.info("waiting 60sec before retrying")
-        time.sleep(60)
-        return reserve_namespace(duration, retries, specific_namespace, attempt=attempt)
-
-    namespace = random.choice(available_namespaces)
-
-    if not _should_renew_ns(namespace, duration):
-        return namespace
-
-    requester_id = _reserve_ns_for_duration(namespace, duration)
-
-    # to avoid race conditions, wait and verify we still own this namespace
-    time.sleep(RESERVATION_DELAY_SEC)
-    namespace.refresh()
-    if str(namespace.requester) != str(requester_id):
-        log.warning("hit namespace reservation conflict")
-
-        if retries and attempt > retries:
-            log.error("maximum retries reached")
-            return None
-
-        return reserve_namespace(duration, retries, specific_namespace, attempt=attempt)
-
-    return namespace
+    return ns_name, None
 
 
 def release_namespace(namespace):
-    ns = Namespace(name=namespace)
-    ns.reserved = False
-    ns.requester = None
-    ns.requester_name = None
-    ns.ready = False
-    ns.update()
+    try:
+        res = get_reservation(namespace=namespace)
+        if res:
+            res_config = process_reservation(
+                res["metadata"]["name"],
+                res["spec"]["requester"],
+                "-240h",  # hack
+            )
+
+            apply_config(None, list_resource=res_config)
+            log.info("releasing namespace '%s'", namespace)
+        else:
+            raise FatalError("Reservation lookup failed")
+    except (KeyboardInterrupt, Exception, TimedOutError, FatalError) as err:
+        log.error("Encountered error during namespace release: %s", err)
+        return err
+    
+    return None
 
 
 def _delete_resources(namespace):

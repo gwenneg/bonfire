@@ -136,6 +136,15 @@ def _warn_of_existing(requester):
         sys.exit(0)
 
 
+def _get_requester():
+    try:
+        requester = whoami()
+    except Exception:
+        log.info("whoami returned an error - setting requester to 'bonfire'")  # minikube
+        requester = "bonfire"
+    return requester
+
+
 def _reserve_namespace(duration, retries, namespace):
     log.info(
         "reserving ephemeral namespace%s...",
@@ -663,51 +672,19 @@ def _cmd_namespace_reserve(bot, name, requester, duration, timeout):
         msg = f"reservation failed: {str(err)}"
         _error(msg)
 
-    try:
-        res = get_reservation(name)
-        # Name should be unique on reservation creation.
-        if res:
-            raise FatalError(f"Reservation with name {name} already exists")
+    if requester is None:
+        requester = _get_requester()
 
-        res_config = process_reservation(name, requester, duration)
+    if not bot:
+        if check_for_existing_reservation(requester):
+            _warn_of_existing(requester)
 
-        log.debug("processed reservation:\n%s", res_config)
+    ns_name, err = reserve_namespace(name, requester, duration, timeout)
 
-        if not bot:
-            if check_for_existing_reservation(res_config["items"][0]["spec"]["requester"]):
-                _warn_of_existing(res_config["items"][0]["spec"]["requester"])
-
-        try:
-            res_name = res_config["items"][0]["metadata"]["name"]
-        except (KeyError, IndexError):
-            raise Exception(
-                "error parsing name of Reservation from processed template, "
-                "check Reservation template"
-            )
-
-        apply_config(None, list_resource=res_config)
-
-        ns_name = wait_on_reservation(res_name, timeout)
-    except KeyboardInterrupt as err:
-        log.error("aborted by keyboard interrupt!")
+    if err != None:
         _err_handler(err)
-    except TimedOutError as err:
-        log.error("hit timeout error: %s", err)
-        _err_handler(err)
-    except FatalError as err:
-        log.error("hit fatal error: %s", err)
-        _err_handler(err)
-    except Exception as err:
-        log.exception("hit unexpected error!")
-        _err_handler(err)
-    else:
-        log.info(
-            "namespace '%s' is reserved by '%s' for '%s'",
-            ns_name,
-            res_config["items"][0]["spec"]["requester"],
-            duration,
-        )
-        click.echo(ns_name)
+    
+    click.echo(ns_name)
 
 
 @namespace.command("release")
@@ -724,32 +701,13 @@ def _cmd_namespace_release(namespace, force):
     def _err_handler(err):
         msg = f"reservation deletion failed: {str(err)}"
         _error(msg)
+    
+    if not force:
+        _warn_before_delete()
+    
+    err = release_namespace(namespace)
 
-    try:
-        res = get_reservation(namespace=namespace)
-        if res:
-            _warn_before_delete()
-            res_config = process_reservation(
-                res["metadata"]["name"],
-                res["spec"]["requester"],
-                "-240h",  # hack
-            )
-
-            apply_config(None, list_resource=res_config)
-            log.info("releasing namespace '%s'", namespace)
-        else:
-            raise FatalError("Reservation lookup failed")
-    except KeyboardInterrupt as err:
-        log.error("aborted by keyboard interrupt!")
-        _err_handler(err)
-    except TimedOutError as err:
-        log.error("hit timeout error: %s", err)
-        _err_handler(err)
-    except FatalError as err:
-        log.error("hit fatal error: %s", err)
-        _err_handler(err)
-    except Exception as err:
-        log.exception("hit unexpected error!")
+    if err != None:
         _err_handler(err)
 
 
@@ -977,14 +935,6 @@ def _cmd_process(
     is_flag=True,
     help="Do not release namespace reservation if deployment fails",
 )
-@click.option(
-    "--retries",
-    "-r",
-    required=False,
-    type=int,
-    default=0,
-    help="how many times to retry namespace reserve before giving up (default: infinite)",
-)
 @options(_ns_reserve_options)
 @options(_timeout_option)
 def _cmd_config_deploy(
@@ -1005,7 +955,6 @@ def _cmd_config_deploy(
     name,
     requester,
     duration,
-    retries,
     timeout,
     no_release_on_fail,
     component_filter,
@@ -1017,9 +966,14 @@ def _cmd_config_deploy(
     operator_reservation = get_reservation(namespace=requested_ns)
 
     if not operator_reservation:
-        used_ns_reservation_system, ns = _get_target_namespace(duration, retries, requested_ns)
+        requester = requester if requester else _get_requester()
+        if check_for_existing_reservation(requester):
+            _warn_of_existing(requester)
+        ns, err = reserve_namespace(name, requester, duration, timeout)
+        if err != None:
+            _error(f"Error during namespace reservation. Error: {str(err)}")
     else:
-        used_ns_reservation_system, ns = False, requested_ns
+        ns = requested_ns
 
     if import_secrets:
         import_secrets_from_dir(secrets_dir)
@@ -1038,7 +992,7 @@ def _cmd_config_deploy(
 
     def _err_handler(err):
         try:
-            if not no_release_on_fail and not requested_ns and used_ns_reservation_system:
+            if not no_release_on_fail and not requested_ns:
                 # if we auto-reserved this ns, auto-release it on failure unless
                 # --no-release-on-fail was requested
                 log.info("releasing namespace '%s'", ns)
@@ -1330,155 +1284,6 @@ def _cmd_apps_what_depends_on(
     apps = _get_apps_config(source, target_env, None, local_config_path)
     found = find_what_depends_on(apps, component)
     print("\n".join(found) or f"no apps depending on {component} found")
-
-
-@reservation.command("create")
-@click.option(
-    "--bot",
-    "-b",
-    is_flag=True,
-    help="Use this flag to skip the duplicate reservation check (for automation)",
-)
-@options(_reservation_process_options)
-@options(_timeout_option)
-def _create_new_reservation(bot, name, requester, duration, timeout):
-    def _err_handler(err):
-        msg = f"reservation failed: {str(err)}"
-        _error(msg)
-
-    try:
-        res = get_reservation(name)
-        # Name should be unique on reservation creation.
-        if res:
-            raise FatalError(f"Reservation with name {name} already exists")
-
-        res_config = process_reservation(name, requester, duration)
-
-        log.debug("processed reservation:\n%s", res_config)
-
-        if not bot:
-            if check_for_existing_reservation(res_config["items"][0]["spec"]["requester"]):
-                _warn_of_existing(res_config["items"][0]["spec"]["requester"])
-
-        try:
-            res_name = res_config["items"][0]["metadata"]["name"]
-        except (KeyError, IndexError):
-            raise Exception(
-                "error parsing name of Reservation from processed template, "
-                "check Reservation template"
-            )
-
-        apply_config(None, list_resource=res_config)
-
-        ns_name = wait_on_reservation(res_name, timeout)
-    except KeyboardInterrupt as err:
-        log.error("aborted by keyboard interrupt!")
-        _err_handler(err)
-    except TimedOutError as err:
-        log.error("hit timeout error: %s", err)
-        _err_handler(err)
-    except FatalError as err:
-        log.error("hit fatal error: %s", err)
-        _err_handler(err)
-    except Exception as err:
-        log.exception("hit unexpected error!")
-        _err_handler(err)
-    else:
-        log.info(
-            "namespace '%s' is reserved by '%s' for '%s'",
-            ns_name,
-            res_config["items"][0]["spec"]["requester"],
-            duration,
-        )
-        click.echo(ns_name)
-
-
-@reservation.command("extend")
-@click.option(
-    "--duration",
-    "-d",
-    type=str,
-    default="1h",
-    help="Amount of time to extend the reservation",
-    callback=_validate_reservation_duration,
-)
-@options(_reservation_lookup_options)
-def _extend_reservation(name, namespace, requester, duration):
-    def _err_handler(err):
-        msg = f"reservation extension failed: {str(err)}"
-        _error(msg)
-
-    if not (name or namespace or requester):
-        _err_handler(
-            "To extend a reservation provide one of name, "
-            "namespace, or requester. See bonfire reservation extend -h"
-        )
-
-    try:
-        res = get_reservation(name, namespace, requester)
-        if res:
-            res_config = process_reservation(
-                res["metadata"]["name"],
-                res["spec"]["requester"],
-                duration,
-            )
-
-            log.debug("processed reservation:\n%s", res_config)
-
-            apply_config(None, list_resource=res_config)
-        else:
-            raise FatalError("Reservation lookup failed")
-    except KeyboardInterrupt as err:
-        log.error("aborted by keyboard interrupt!")
-        _err_handler(err)
-    except TimedOutError as err:
-        log.error("hit timeout error: %s", err)
-        _err_handler(err)
-    except FatalError as err:
-        log.error("hit fatal error: %s", err)
-        _err_handler(err)
-    except Exception as err:
-        log.exception("hit unexpected error!")
-        _err_handler(err)
-    else:
-        log.info("reservation '%s' extended by '%s'", res["metadata"]["name"], duration)
-
-
-@reservation.command("delete")
-@options(_reservation_lookup_options)
-def _delete_reservation(name, namespace, requester):
-    def _err_handler(err):
-        msg = f"reservation deletion failed: {str(err)}"
-        _error(msg)
-
-    if not (name or namespace or requester):
-        _err_handler(
-            "To delete a reservation provide one of name, "
-            "namespace, or requester. See bonfire reservation delete -h"
-        )
-
-    try:
-        res = get_reservation(name, namespace, requester)
-        if res:
-            _warn_before_delete()
-            res_name = res["metadata"]["name"]
-            log.info("deleting reservation '%s'", res_name)
-            oc("delete", "reservation", res_name)
-            log.info("reservation '%s' deleted", res_name)
-        else:
-            raise FatalError("Reservation lookup failed")
-    except KeyboardInterrupt as err:
-        log.error("aborted by keyboard interrupt!")
-        _err_handler(err)
-    except TimedOutError as err:
-        log.error("hit timeout error: %s", err)
-        _err_handler(err)
-    except FatalError as err:
-        log.error("hit fatal error: %s", err)
-        _err_handler(err)
-    except Exception as err:
-        log.exception("hit unexpected error!")
-        _err_handler(err)
 
 
 @reservation.command("list")
